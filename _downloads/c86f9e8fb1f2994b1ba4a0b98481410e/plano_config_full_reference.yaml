@@ -1,5 +1,5 @@
 # Plano Gateway configuration version
-version: v0.3.0
+version: v0.4.0
 
 # External HTTP agents - API type is controlled by request path (/v1/responses, /v1/messages, /v1/chat/completions)
 agents:
@@ -32,17 +32,8 @@ model_providers:
   - model: mistral/ministral-3b-latest
     access_key: $MISTRAL_API_KEY
 
-  # routing_preferences: tags a model with named capabilities so Plano's LLM router
-  # can select the best model for each request based on intent. Requires the
-  # Arch-Router model (or equivalent) to be configured in overrides.llm_routing_model.
-  # Each preference has a name (short label) and a description (used for intent matching).
   - model: groq/llama-3.3-70b-versatile
     access_key: $GROQ_API_KEY
-    routing_preferences:
-      - name: code generation
-        description: generating new code snippets, functions, or boilerplate based on user prompts or requirements
-      - name: code review
-        description: reviewing, analyzing, and suggesting improvements to existing code
 
   # passthrough_auth: forwards the client's Authorization header upstream instead of
   # using the configured access_key. Useful for LiteLLM or similar proxy setups.
@@ -56,6 +47,14 @@ model_providers:
     http_host: api.custom-provider.com
     access_key: $CUSTOM_API_KEY
 
+  # headers: optional map of extra HTTP headers sent on upstream requests (after auth).
+  # Use for provider-specific requirements such as User-Agent, org IDs, or account headers.
+  - model: moonshotai/kimi-for-coding
+    access_key: $MOONSHOTAI_API_KEY
+    base_url: https://api.kimi.com/coding/v1
+    headers:
+      User-Agent: "KimiCLI/1.3"
+
 # Model aliases - use friendly names instead of full provider model names
 model_aliases:
   fast-llm:
@@ -63,6 +62,47 @@ model_aliases:
 
   smart-llm:
     target: gpt-4o
+
+# routing_preferences: top-level list that tags named task categories with an
+# ordered pool of candidate models. Plano's LLM router matches incoming requests
+# against these descriptions and returns an ordered list of models; the client
+# uses models[0] as primary and retries with models[1], models[2]... on 429/5xx.
+# Requires overrides.llm_routing_model to point at Plano-Orchestrator (or equivalent).
+# Each model in `models` must be declared in model_providers above.
+# selection_policy is optional: {prefer: cheapest|fastest|none} lets the router
+# reorder candidates using live cost/latency data from model_metrics_sources.
+routing_preferences:
+  - name: code generation
+    description: generating new code snippets, functions, or boilerplate based on user prompts or requirements
+    models:
+      - anthropic/claude-sonnet-4-0
+      - openai/gpt-4o
+      - groq/llama-3.3-70b-versatile
+  - name: code review
+    description: reviewing, analyzing, and suggesting improvements to existing code
+    models:
+      - anthropic/claude-sonnet-4-0
+      - groq/llama-3.3-70b-versatile
+    selection_policy:
+      prefer: cheapest
+
+# model_metrics_sources: external catalogs the router reads to reorder candidate
+# models for selection_policy.prefer. A `cost` source ranks `prefer: cheapest`;
+# a `latency` source ranks `prefer: fastest`. Both are optional.
+model_metrics_sources:
+  # Cost catalog. provider: models.dev | digitalocean (default url per provider).
+  - type: cost
+    provider: models.dev
+    url: https://models.dev/api.json   # optional; omit to use the provider default
+    refresh_interval: 3600             # optional, seconds
+    model_aliases:                     # optional: catalog key -> Plano model name
+      openai/gpt-oss-120b: openai/gpt-4o
+  # Latency catalog (Prometheus). Used for selection_policy.prefer: fastest.
+  - type: latency
+    provider: prometheus
+    url: http://prometheus:9090
+    query: avg by (model_name) (rate(plano_llm_latency_seconds_sum[5m]))
+    refresh_interval: 60
 
 # HTTP listeners - entry points for agent routing, prompt targets, and direct LLM access
 listeners:
@@ -170,14 +210,28 @@ overrides:
   # Path to the trusted CA bundle for upstream TLS verification
   upstream_tls_ca_path: /etc/ssl/certs/ca-certificates.crt
   # Model used for intent-based LLM routing (must be listed in model_providers)
-  llm_routing_model: Arch-Router
+  llm_routing_model: Plano-Orchestrator
   # Model used for agent orchestration (must be listed in model_providers)
   agent_orchestration_model: Plano-Orchestrator
+  # Disable agentic signal analysis (frustration, repetition, escalation, etc.)
+  # on LLM responses to save CPU. Default: false.
+  disable_signals: false
 
 # Model affinity — pin routing decisions for agentic loops
 routing:
   session_ttl_seconds: 600    # How long a pinned session lasts (default: 600s / 10 min)
   session_max_entries: 10000  # Max cached sessions before eviction (upper limit: 10000)
+  # Opt-in: route only on a trailing user message; replay the prior decision on
+  # tool results / assistant steps. Default false.
+  # route_on_user_only: true
+  # session_cache controls the backend used to store affinity state.
+  # "memory" (default) is in-process and works for single-instance deployments.
+  # "redis" shares state across replicas — required for multi-replica / Kubernetes setups.
+  session_cache:
+    type: memory              # "memory" (default) or "redis"
+    # url is required when type is "redis". Supports redis:// and rediss:// (TLS).
+    # url: redis://localhost:6379
+    # tenant_header: x-org-id  # optional; when set, keys are scoped as plano:affinity:{tenant_id}:{session_id}
 
 # State storage for multi-turn conversation history
 state_storage:
@@ -210,3 +264,16 @@ tracing:
     static:
       environment: production
       service.team: platform
+  # Provider-agnostic export destinations. LLM spans are streamed to each of
+  # these in addition to any opentracing_grpc_endpoint above.
+  exporters:
+    # PostHog AI observability: each LLM call is captured as an $ai_generation event.
+    - type: posthog
+      # PostHog host. The /batch/ capture path is appended automatically.
+      url: https://us.i.posthog.com
+      # PostHog project API key (token). Supports $ENV_VAR expansion.
+      api_key: $POSTHOG_API_KEY
+      # Optional: request header used as the PostHog distinct_id. Omit for anonymous capture.
+      distinct_id_header: x-user-id
+      # Optional: include the (truncated) user message as $ai_input. Defaults to false.
+      capture_messages: false
